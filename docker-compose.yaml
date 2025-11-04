@@ -1,0 +1,18 @@
+services:
+  websocket-go:
+    build: .
+    container_name: websocket_server_go
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    restart: unless-stopped
+    
+# dibawa ini hanya untuk jika redis berjalan dicontainer yang berbeda maka harus create Jaringan Docker Kustom
+# command 'docker network create my-app-net' kemudian 'docker network connect my-app-net {nama_kontainer redis}'
+    networks:
+      - my-app-net
+
+networks:
+  my-app-net:
+    external: true

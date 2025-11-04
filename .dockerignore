@@ -1,0 +1,17 @@
+# Abaikan file .git
+.git
+.gitignore
+
+# Abaikan file .env, rahasia akan di-inject saat runtime
+.env
+.env.example
+
+# Abaikan file pengujian HTML
+index.html
+
+# Abaikan binary yang mungkin ter-build secara lokal
+server
+server.exe
+
+# Abaikan file log
+*.log
