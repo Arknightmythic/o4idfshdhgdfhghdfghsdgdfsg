@@ -1,0 +1,123 @@
+# .github/workflows/trivy-security.yml
+name: Trivy Security Container Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # needed for SARIF uploads (public repos okay)
+
+env:
+  TRIVY_SEVERITY: CRITICAL,HIGH
+  DOCKERFILE_PATH: ./Dockerfile   # <-- set your Dockerfile path
+
+jobs:
+  image-scan:
+    name: Trivy – Container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Validate Dockerfile path
+        run: |
+          echo "Using DOCKERFILE_PATH=${DOCKERFILE_PATH}"
+          test -f "${DOCKERFILE_PATH}" || { echo "Dockerfile not found at ${DOCKERFILE_PATH}"; exit 1; }
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/trivy
+          key: ${{ runner.os }}-trivydb
+      
+      - name: Create placeholder .env for CI (no secrets)
+        run: |
+          cat > .env <<'EOF'
+          ALLOWED_ORIGINS=test.com
+          SERVER_PORT=8080
+          JWT_ACCESS_EXPIRY=15m
+          JWT_SECRET=secret
+          JWT_REFRESH_EXPIRY=168h
+          DB_HOST=0.0.0.0
+          DB_PORT=5432
+          DB_USER=test
+          DB_PASSWORD=test
+          DB_NAME=test
+          DB_DRIVER=postgresql
+          DB_SCHEMA=test
+          EXTERNAL_API_BASE_URL=http://172.16.12.98:9534
+          X_API_KEY=BangJumAwesome
+          REDIS_HOST=redis
+          REDIS_PORT=6379
+          REDIS_PASSWORD=password
+          REDIS_DB=0
+          MAX_FILE_SIZE_ALLOWED=70
+          SUPERADMIN_PASSWORD=password
+          COOKIE_PATH=/
+          COOKIE_HTTP_ONLY=
+          COOKIE_SAME_SITE=strict
+          COOKIE_ACCESS_TOKEN_MAX_AGE=
+          COOKIE_REFRESH_TOKEN_MAX_AGE=
+          BCRYPT_SALT=default-salt-please-change-in-production
+          # add ONLY harmless placeholders required by build
+          EOF
+
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ env.DOCKERFILE_PATH }}
+          tags: localbuild:${{ github.sha }}
+          load: true
+
+      # SARIF (gates the build)
+      - name: Trivy Image (SARIF, fail on HIGH/CRITICAL)
+        id: trivy_img_sarif
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: localbuild:${{ github.sha }}
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+          format: sarif
+          output: trivy-image.sarif
+          limit-severities-for-sarif: true
+          exit-code: '1'
+
+      # Human-readable table for logs + summary
+      - name: Trivy Image (table report for summary)
+        if: always()
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: image
+          image-ref: localbuild:${{ github.sha }}
+          severity: ${{ env.TRIVY_SEVERITY }}
+          ignore-unfixed: true
+          format: table
+          output: trivy-image.txt
+          exit-code: '0'
+
+      - name: Add Image report to Job Summary
+        if: always()
+        run: |
+          {
+            echo "### Trivy container findings";
+            echo;
+            echo '```';
+            cat trivy-image.txt || true
+            echo '```';
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: Upload Image text report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report
+          path: trivy-image.txt
+          retention-days: 7
