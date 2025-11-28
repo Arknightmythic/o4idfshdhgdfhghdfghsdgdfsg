@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	// "strconv" // DIHAPUS
 	"sync"
 	"sync/atomic"
 	"time"
@@ -169,7 +168,7 @@ func (h *Hub) runMetricsLogger() {
 
 		log.Println("\n--- METRICS (10s) ---")
 		log.Printf("Messages In (from Clients): %d", in)
-		log.Printf("Messages Out (to Clients):  %d", out)
+		log.Printf("Messages Out (to Clients):  %d", out)
 		log.Printf("Avg. Redis Publish Latency: %.2f ms", avgLatencyMs)
 		log.Println("-----------------------\n")
 
@@ -282,17 +281,36 @@ func (h *Hub) handleSubscribe(client *Client, msg *IncomingMessage) {
 	log.Printf("[SUB] Klien subscribe ke channel: %s. Total: %d", msg.Channel, len(h.channels[msg.Channel]))
 	h.channelsMu.Unlock()
 
-	// Tentukan ID awal untuk catch-up
-	startID := "0" // Mulai dari awal
+	ctx := context.Background()
+
+	// 1. Dapatkan ID pesan terakhir SAAT INI (batas atas untuk catch-up)
+	// XRevRange mengambil 1 pesan terakhir. "+" adalah ID tertinggi, "-" adalah ID terendah.
+	streams, err := h.redisClient.XRevRangeN(ctx, msg.Channel, "+", "-", 1).Result()
+
+	// Inisialisasi endID untuk riwayat. Jika stream kosong, nilainya akan menjadi "+"
+	var endID string = "+"
+
+	if err != nil && err != redis.Nil {
+		log.Printf("[CATCH-UP] Gagal mendapatkan ID terakhir stream %s: %v", msg.Channel, err)
+	} else if len(streams) > 0 {
+		// Jika ada pesan, gunakan ID pesan terakhir sebagai batas (End ID)
+		endID = streams[0].ID
+		log.Printf("[CATCH-UP] Batas Atas (End ID) untuk riwayat %s: %s", msg.Channel, endID)
+	}
+
+	// Tentukan ID awal untuk catch-up (Start ID)
+	startID := "0" // Mulai dari awal stream
 	if msg.LastMessageID != "" && msg.LastMessageID != "$" {
 		startID = msg.LastMessageID
 	}
 
 	// Mulai goroutine untuk listener real-time (jika belum ada)
-	go h.ensureRealtimeReader(msg.Channel)
+	// Kita passing EndID. Reader real-time akan mulai dari ID ini (tepat setelah riwayat)
+	go h.ensureRealtimeReader(msg.Channel, endID)
 
 	// Mulai goroutine untuk mengirim riwayat pesan ke klien INI SAJA
-	go h.sendHistoricalMessages(client, msg.Channel, startID)
+	// Kita passing StartID dan EndID. Riwayat akan dikirim dalam rentang [startID, endID]
+	go h.sendHistoricalMessages(client, msg.Channel, startID, endID)
 
 	client.SendJSON(map[string]string{"status": "subscribed", "channel": msg.Channel})
 }
@@ -327,81 +345,91 @@ func (h *Hub) handlePublish(client *Client, msg *IncomingMessage) {
 		return
 	}
 
+	// =========================================================================
+	// !!! PERBAIKAN DIMULAI DI SINI: Atur TTL Key Channel 24 Jam !!!
+	// =========================================================================
+	// Set TTL 24 jam. Jika key sudah ada, TTL akan diperbarui (Expire).
+	// Ini memastikan channel hanya dihapus jika tidak ada pesan (aktivitas) selama 24 jam.
+	const streamTTL = 24 * time.Hour
+	if err := h.redisClient.Expire(context.Background(), msg.Channel, streamTTL).Err(); err != nil {
+		log.Printf("❌ [REDIS-STREAM] GAGAL mengatur TTL %s untuk %s: %v", streamTTL.String(), msg.Channel, err)
+	} else {
+		log.Printf("✅ [REDIS-STREAM] TTL %s diatur/diperbarui untuk %s", streamTTL.String(), msg.Channel)
+	}
+	// =========================================================================
+	// !!! PERBAIKAN SELESAI !!!
+	// =========================================================================
+
 	latency := time.Since(startTime)
 	h.metrics.publishLatencyTotal.Add(uint64(latency.Nanoseconds()))
 	h.metrics.publishCount.Add(1)
 
 	client.SendJSON(map[string]string{"status": "ack", "messageId": msg.MessageID})
 
-	// ===== PERBAIKAN DI SINI =====
 	// Gunakan variabel streamID di dalam log
 	log.Printf("[REDIS-STREAM] Berhasil XADD ke %s (ID: %s, Latency: %v)", msg.Channel, streamID, latency)
 }
 
 // sendHistoricalMessages (Porting dari fungsi JS)
-// Mengirim pesan riwayat ke SATU klien spesifik
-func (h *Hub) sendHistoricalMessages(client *Client, channel string, startID string) {
-	log.Printf("[CATCH-UP] Mengambil riwayat untuk %s dari ID: %s...", channel, startID)
-	currentID := startID
+// Mengirim pesan riwayat ke SATU klien spesifik dalam rentang ID [startID, endID]
+func (h *Hub) sendHistoricalMessages(client *Client, channel string, startID string, endID string) {
+	// Jika endID adalah default ("+"), berarti stream kosong saat subscribe, tidak perlu catch-up.
+	if endID == "+" {
+		log.Printf("[CATCH-UP] Stream %s kosong saat subscribe. Tidak ada riwayat untuk diambil.", channel)
+		return
+	}
+
+	log.Printf("[CATCH-UP] Mengambil riwayat untuk %s dari ID: %s hingga %s...", channel, startID, endID)
 	ctx := context.Background()
 
-	for {
-		// XRead non-blocking, hanya ambil batch
-		response, err := h.redisClient.XRead(ctx, &redis.XReadArgs{
-			Streams: []string{channel, currentID},
-			Count:   100,
-		}).Result()
+	// Ganti XRead loop tak terbatas dengan XRange yang dibatasi oleh startID dan endID.
+	messages, err := h.redisClient.XRange(ctx, channel, startID, endID).Result()
 
-		if err == redis.Nil || len(response) == 0 {
-			break // Tidak ada pesan lagi
-		}
-		if err != nil {
-			log.Printf("[CATCH-UP] Error mengambil riwayat %s: %v", channel, err)
-			break
-		}
-
-		messages := response[0].Messages
-		if len(messages) == 0 {
-			break
-		}
-
-		for _, msg := range messages {
-			currentID = msg.ID // Perbarui ID untuk iterasi berikutnya
-
-			var data interface{}
-			// Ambil data pesan dari map
-			messageDataStr, ok := msg.Values["messageData"].(string)
-			if !ok {
-				log.Println("[CATCH-UP] Gagal mengambil messageData dari stream")
-				continue
-			}
-			// Unmarshal string JSON ke interface{}
-			if err := json.Unmarshal([]byte(messageDataStr), &data); err != nil {
-				log.Printf("[CATCH-UP] Gagal parse JSON dari stream: %v", err)
-				continue
-			}
-
-			broadcastMessage := OutgoingMessage{
-				Event:    "message",
-				Channel:  channel,
-				StreamID: msg.ID,
-				Data:     data,
-			}
-
-			if err := client.SendJSON(broadcastMessage); err != nil {
-				// Klien mungkin terputus saat catch-up
-				log.Printf("[CATCH-UP] Gagal mengirim pesan riwayat ke klien, berhenti: %v", err)
-				return // Hentikan goroutine ini
-			}
-			h.metrics.messagesOut.Add(1)
-		}
+	if err == redis.Nil || len(messages) == 0 {
+		log.Printf("[CATCH-UP] Tidak ada pesan riwayat yang ditemukan dalam rentang %s-%s.", startID, endID)
+		return
 	}
-	log.Printf("[CATCH-UP] Selesai mengambil riwayat untuk %s.", channel)
+	if err != nil {
+		log.Printf("[CATCH-UP] Error mengambil riwayat %s: %v", channel, err)
+		return
+	}
+
+	for _, msg := range messages {
+
+		var data interface{}
+		// Ambil data pesan dari map
+		messageDataStr, ok := msg.Values["messageData"].(string)
+		if !ok {
+			log.Println("[CATCH-UP] Gagal mengambil messageData dari stream")
+			continue
+		}
+		// Unmarshal string JSON ke interface{}
+		if err := json.Unmarshal([]byte(messageDataStr), &data); err != nil {
+			log.Printf("[CATCH-UP] Gagal parse JSON dari stream: %v", err)
+			continue
+		}
+
+		broadcastMessage := OutgoingMessage{
+			Event:    "message",
+			Channel:  channel,
+			StreamID: msg.ID,
+			Data:     data,
+		}
+
+		if err := client.SendJSON(broadcastMessage); err != nil {
+			// Klien mungkin terputus saat catch-up
+			log.Printf("[CATCH-UP] Gagal mengirim pesan riwayat ke klien, berhenti: %v", err)
+			return // Hentikan goroutine ini
+		}
+		h.metrics.messagesOut.Add(1)
+	}
+	log.Printf("[CATCH-UP] Selesai mengambil riwayat untuk %s. Total pesan: %d.", channel, len(messages))
 }
 
 // ensureRealtimeReader (Porting dari fungsi JS)
 // Memastikan HANYA SATU listener real-time per channel
-func (h *Hub) ensureRealtimeReader(channel string) {
+// Memulai XREAD BLOCK tepat setelah pesan riwayat terakhir (lastSeenID)
+func (h *Hub) ensureRealtimeReader(channel string, lastSeenID string) {
 	// Cek 1: Apakah sudah ada reader yang berjalan? (Aman-konkurensi)
 	h.readerMu.Lock()
 	if h.activeStreamReaders[channel] {
@@ -411,8 +439,16 @@ func (h *Hub) ensureRealtimeReader(channel string) {
 	// Tandai sebagai aktif SEBELUM membuka kunci
 	h.activeStreamReaders[channel] = true
 	h.readerMu.Unlock()
-	
-	log.Printf("[STREAM] Memulai reader REAL-TIME untuk channel: %s", channel)
+
+	// Tentukan ID awal untuk reader real-time.
+	// Jika lastSeenID adalah "+", berarti stream kosong saat subscribe, mulai dari ID terbaru "$".
+	// Jika ada ID (misal: "1664162000000-99"), kita gunakan ID itu.
+	currentID := lastSeenID
+	if currentID == "+" {
+		currentID = "$" // Mulai dari pesan terbaru
+	}
+
+	log.Printf("[STREAM] Memulai reader REAL-TIME untuk channel: %s dari ID: %s", channel, currentID)
 
 	// Set cleanup: pastikan kita menghapus tanda 'aktif' saat reader berhenti
 	defer func() {
@@ -422,7 +458,6 @@ func (h *Hub) ensureRealtimeReader(channel string) {
 		log.Printf("[STREAM] Menghentikan reader REAL-TIME untuk channel: %s", channel)
 	}()
 
-	currentID := "$" // Mulai dari pesan terbaru
 	ctx := context.Background()
 
 	for {
@@ -443,6 +478,7 @@ func (h *Hub) ensureRealtimeReader(channel string) {
 		}
 
 		// XRead blocking
+		// currentID sudah diinisialisasi dengan ID yang tepat (setelah riwayat atau "$")
 		response, err := h.subscriberClient.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{channel, currentID},
 			Count:   100,
@@ -475,7 +511,7 @@ func (h *Hub) ensureRealtimeReader(channel string) {
 		if len(clientsToBroadcast) == 0 {
 			continue // Klien mungkin disconnect saat kita XREAD
 		}
-		
+
 		messages := response[0].Messages
 		for _, msg := range messages {
 			currentID = msg.ID // Perbarui ID untuk iterasi XREAD berikutnya
@@ -497,7 +533,7 @@ func (h *Hub) ensureRealtimeReader(channel string) {
 				StreamID: msg.ID,
 				Data:     data,
 			}
-			
+
 			// Broadcast ke semua klien yang terdaftar
 			for _, client := range clientsToBroadcast {
 				// Kita bisa menjalankan ini di goroutine baru jika pengiriman lambat
