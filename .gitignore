@@ -24,3 +24,4 @@ docker-compose.override.yml
 .docker/
 
 index.html
+sonar-project.properties
