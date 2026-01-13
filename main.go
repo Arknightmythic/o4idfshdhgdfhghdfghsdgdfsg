@@ -111,12 +111,17 @@ func NewHub() *Hub {
 }
 
 // setupRedis menginisialisasi dan memonitor koneksi Redis
+
 func (h *Hub) setupRedis() {
 	// Klien untuk PUB/XADD
 	pubOpt, err := redis.ParseURL(redisURL)
 	if err != nil {
 		log.Fatalf("Gagal parse REDIS_URL (PUB): %v", err)
 	}
+
+	pubOpt.PoolSize = 50
+	pubOpt.PoolTimeout = 10 * time.Second
+
 	h.redisClient = redis.NewClient(pubOpt)
 
 	// Klien untuk SUB/XREAD (duplikat koneksi seperti di JS)
@@ -124,13 +129,16 @@ func (h *Hub) setupRedis() {
 	if err != nil {
 		log.Fatalf("Gagal parse REDIS_URL (SUB): %v", err)
 	}
+
+	subOpt.PoolSize = 50
+	subOpt.PoolTimeout = 10 * time.Second
+
 	h.subscriberClient = redis.NewClient(subOpt)
 
 	// Mulai monitor untuk kedua klien
 	go h.monitorRedisConnection(h.redisClient, "PUB")
 	go h.monitorRedisConnection(h.subscriberClient, "SUB")
 }
-
 // monitorRedisConnection memeriksa koneksi secara berkala
 func (h *Hub) monitorRedisConnection(client *redis.Client, name string) {
 	ctx := context.Background()
