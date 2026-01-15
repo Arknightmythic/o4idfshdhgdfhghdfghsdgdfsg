@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
+	"strconv"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
@@ -20,6 +20,8 @@ var (
 	websocketSecretKey string
 	redisURL           string
 	port               string
+	redisPubPoolSize      string
+	redisSubPoolSize      string
 )
 
 // --- Struct untuk Pesan JSON ---
@@ -113,29 +115,58 @@ func NewHub() *Hub {
 // setupRedis menginisialisasi dan memonitor koneksi Redis
 
 func (h *Hub) setupRedis() {
-	// Klien untuk PUB/XADD
+	// --- 1. Persiapan Konfigurasi Pool ---
+	
+	// Parse PUB Pool Size
+	pubPoolSizeInt, err := strconv.Atoi(redisPubPoolSize)
+	if err != nil || pubPoolSizeInt <= 0 {
+		log.Printf("⚠️ Format REDIS_PUB_POOL_SIZE salah ('%s'). Fallback ke 50.", redisPubPoolSize)
+		pubPoolSizeInt = 50
+	} else {
+		log.Printf("⚙️ Konfigurasi: PUB Pool Size diatur ke %d", pubPoolSizeInt)
+	}
+
+	// Parse SUB Pool Size
+	subPoolSizeInt, err := strconv.Atoi(redisSubPoolSize)
+	if err != nil || subPoolSizeInt <= 0 {
+		log.Printf("⚠️ Format REDIS_SUB_POOL_SIZE salah ('%s'). Fallback ke 50.", redisSubPoolSize)
+		subPoolSizeInt = 50
+	} else {
+		log.Printf("⚙️ Konfigurasi: SUB Pool Size diatur ke %d", subPoolSizeInt)
+	}
+
+	// --- 2. Setup Klien PUB (Publisher) ---
 	pubOpt, err := redis.ParseURL(redisURL)
 	if err != nil {
 		log.Fatalf("Gagal parse REDIS_URL (PUB): %v", err)
 	}
 
-	pubOpt.PoolSize = 50
-	pubOpt.PoolTimeout = 10 * time.Second
+	// Terapkan konfigurasi Pool Size
+	pubOpt.PoolSize = pubPoolSizeInt
+	pubOpt.PoolTimeout = 10 * time.Second // Standar
 
 	h.redisClient = redis.NewClient(pubOpt)
 
-	// Klien untuk SUB/XREAD (duplikat koneksi seperti di JS)
+	// --- 3. Setup Klien SUB (Subscriber / Blocking Reader) ---
 	subOpt, err := redis.ParseURL(redisURL)
 	if err != nil {
 		log.Fatalf("Gagal parse REDIS_URL (SUB): %v", err)
 	}
 
-	subOpt.PoolSize = 50
-	subOpt.PoolTimeout = 10 * time.Second
+	// Terapkan konfigurasi Pool Size
+	subOpt.PoolSize = subPoolSizeInt
+	
+	// Logika Cerdas: Jika Pool Size kecil (mode testing), kurangi Timeout agar error cepat muncul
+	if subPoolSizeInt < 10 {
+		subOpt.PoolTimeout = 2 * time.Second
+		log.Println("⚙️ [SUB] Mode Testing: PoolTimeout dipendekkan ke 2 detik.")
+	} else {
+		subOpt.PoolTimeout = 10 * time.Second // Standar
+	}
 
 	h.subscriberClient = redis.NewClient(subOpt)
 
-	// Mulai monitor untuk kedua klien
+	// --- 4. Mulai Monitor ---
 	go h.monitorRedisConnection(h.redisClient, "PUB")
 	go h.monitorRedisConnection(h.subscriberClient, "SUB")
 }
@@ -584,6 +615,8 @@ func main() {
 	// Baca dan validasi Env Vars
 	websocketSecretKey = os.Getenv("WEBSOCKET_SECRET_KEY")
 	redisURL = os.Getenv("REDIS_URL")
+	redisPubPoolSize = os.Getenv("REDIS_PUB_POOL_SIZE")
+	redisSubPoolSize = os.Getenv("REDIS_SUB_POOL_SIZE")
 	port = os.Getenv("PORT")
 
 	if websocketSecretKey == "" {
@@ -599,6 +632,15 @@ func main() {
 		log.Printf("Peringatan: PORT tidak diatur. Menggunakan default: %s", port)
 	}
 
+	if redisPubPoolSize =="" {
+		redisPubPoolSize = "50"
+		log.Printf("Peringatan: REDIS_PUB_POOL_SIZE tidak diatur. Menggunakan default: %s", redisPubPoolSize)
+	}
+	
+	if redisSubPoolSize =="" {
+		redisSubPoolSize = "50"
+		log.Printf("Peringatan: REDIS_SUB_POOL_SIZE tidak diatur. Menggunakan default: %s", redisSubPoolSize)
+	}
 	// Buat Hub
 	hub := NewHub()
 
