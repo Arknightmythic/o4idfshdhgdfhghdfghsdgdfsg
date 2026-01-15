@@ -139,6 +139,7 @@ func (h *Hub) setupRedis() {
 	go h.monitorRedisConnection(h.redisClient, "PUB")
 	go h.monitorRedisConnection(h.subscriberClient, "SUB")
 }
+
 // monitorRedisConnection memeriksa koneksi secara berkala
 func (h *Hub) monitorRedisConnection(client *redis.Client, name string) {
 	ctx := context.Background()
@@ -159,11 +160,12 @@ func (h *Hub) monitorRedisConnection(client *redis.Client, name string) {
 }
 
 // runMetricsLogger mencatat metrik setiap 10 detik
+// runMetricsLogger mencatat metrik setiap 10 detik
 func (h *Hub) runMetricsLogger() {
 	for {
 		time.Sleep(10 * time.Second)
 
-		// Ambil nilai secara atomik
+		// 1. Ambil Metrik Aplikasi
 		in := h.metrics.messagesIn.Load()
 		out := h.metrics.messagesOut.Load()
 		count := h.metrics.publishCount.Load()
@@ -174,13 +176,29 @@ func (h *Hub) runMetricsLogger() {
 			avgLatencyMs = float64(latencyTotalNs) / float64(count) / float64(time.Millisecond)
 		}
 
+		// 2. Ambil Statistik Pool Redis [BARU]
+		// Kita ambil stats untuk klien PUB (h.redisClient) dan SUB (h.subscriberClient)
+		pubStats := h.redisClient.PoolStats()
+		subStats := h.subscriberClient.PoolStats()
+
+		// Hitung koneksi yang sedang sibuk/terpakai
+		pubUsed := pubStats.TotalConns - pubStats.IdleConns
+		subUsed := subStats.TotalConns - subStats.IdleConns
+
 		log.Println("\n--- METRICS (10s) ---")
 		log.Printf("Messages In (from Clients): %d", in)
-		log.Printf("Messages Out (to Clients):  %d", out)
+		log.Printf("Messages Out (to Clients):  %d", out)
 		log.Printf("Avg. Redis Publish Latency: %.2f ms", avgLatencyMs)
+
+		// 3. Log Statistik Pool [BARU]
+		log.Println("- Redis Pool Stats -")
+		log.Printf("PUB Client: %d Used / %d Total (Idle: %d, Misses: %d)",
+			pubUsed, pubStats.TotalConns, pubStats.IdleConns, pubStats.Misses)
+		log.Printf("SUB Client: %d Used / %d Total (Idle: %d, Misses: %d)",
+			subUsed, subStats.TotalConns, subStats.IdleConns, subStats.Misses)
 		log.Println("-----------------------\n")
 
-		// Reset nilai
+		// Reset nilai metrik aplikasi
 		h.metrics.messagesIn.Store(0)
 		h.metrics.messagesOut.Store(0)
 		h.metrics.publishCount.Store(0)
