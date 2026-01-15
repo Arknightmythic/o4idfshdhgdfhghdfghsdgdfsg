@@ -112,6 +112,12 @@ func NewHub() *Hub {
 	return hub
 }
 
+// Konfigurasi Timeouts
+const (
+    pongWait   = 60 * time.Second
+    pingPeriod = (pongWait * 9) / 10 // Harus kurang dari pongWait (misal 54 detik)
+)
+
 // setupRedis menginisialisasi dan memonitor koneksi Redis
 
 func (h *Hub) setupRedis() {
@@ -277,6 +283,27 @@ func (h *Hub) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 // handleClientMessages (menggantikan ws.on('message'))
 func (h *Hub) handleClientMessages(client *Client) {
+	client.conn.SetReadDeadline(time.Now().Add(pongWait))
+    client.conn.SetPongHandler(func(string) error { 
+        client.conn.SetReadDeadline(time.Now().Add(pongWait))
+        return nil 
+    })
+
+    // 2. Setup Ticker untuk Kirim Ping (Goroutine terpisah)
+    go func() {
+		ticker := time.NewTicker(pingPeriod)
+		defer ticker.Stop()
+
+		// PERBAIKAN: Gunakan 'for range' alih-alih 'for { select { case ... } }'
+		for range ticker.C {
+			client.mu.Lock()
+			if err := client.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				client.mu.Unlock()
+				return // Putus koneksi jika gagal ping (koneksi ditutup atau error jaringan)
+			}
+			client.mu.Unlock()
+		}
+	}()
 	// 4. Atur cleanup (menggantikan ws.on('close'))
 	defer func() {
 		log.Println("[CLOSE] Klien terputus.")
