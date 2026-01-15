@@ -3,16 +3,16 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"log"
-	"net/http"
-	"os"
-	"sync"
-	"sync/atomic"
-	"time"
-	"strconv"
 	"github.com/gorilla/websocket"
 	"github.com/joho/godotenv"
 	"github.com/redis/go-redis/v9"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // Konfigurasi dari Environment Variables
@@ -20,8 +20,8 @@ var (
 	websocketSecretKey string
 	redisURL           string
 	port               string
-	redisPubPoolSize      string
-	redisSubPoolSize      string
+	redisPubPoolSize   string
+	redisSubPoolSize   string
 )
 
 // --- Struct untuk Pesan JSON ---
@@ -116,7 +116,7 @@ func NewHub() *Hub {
 
 func (h *Hub) setupRedis() {
 	// --- 1. Persiapan Konfigurasi Pool ---
-	
+
 	// Parse PUB Pool Size
 	pubPoolSizeInt, err := strconv.Atoi(redisPubPoolSize)
 	if err != nil || pubPoolSizeInt <= 0 {
@@ -155,7 +155,7 @@ func (h *Hub) setupRedis() {
 
 	// Terapkan konfigurasi Pool Size
 	subOpt.PoolSize = subPoolSizeInt
-	
+
 	// Logika Cerdas: Jika Pool Size kecil (mode testing), kurangi Timeout agar error cepat muncul
 	if subPoolSizeInt < 10 {
 		subOpt.PoolTimeout = 2 * time.Second
@@ -191,7 +191,6 @@ func (h *Hub) monitorRedisConnection(client *redis.Client, name string) {
 }
 
 // runMetricsLogger mencatat metrik setiap 10 detik
-// runMetricsLogger mencatat metrik setiap 10 detik
 func (h *Hub) runMetricsLogger() {
 	for {
 		time.Sleep(10 * time.Second)
@@ -207,8 +206,7 @@ func (h *Hub) runMetricsLogger() {
 			avgLatencyMs = float64(latencyTotalNs) / float64(count) / float64(time.Millisecond)
 		}
 
-		// 2. Ambil Statistik Pool Redis [BARU]
-		// Kita ambil stats untuk klien PUB (h.redisClient) dan SUB (h.subscriberClient)
+		// 2. Ambil Statistik Pool Redis
 		pubStats := h.redisClient.PoolStats()
 		subStats := h.subscriberClient.PoolStats()
 
@@ -216,15 +214,25 @@ func (h *Hub) runMetricsLogger() {
 		pubUsed := pubStats.TotalConns - pubStats.IdleConns
 		subUsed := subStats.TotalConns - subStats.IdleConns
 
+		// 3. Hitung Active Channels (Real-time Readers) [BARU]
+		// Kita butuh Lock karena map ini tidak thread-safe untuk dibaca saat ada yang nulis
+		h.readerMu.Lock()
+		activeChannelsCount := len(h.activeStreamReaders)
+		h.readerMu.Unlock()
+
 		log.Println("\n--- METRICS (10s) ---")
 		log.Printf("Messages In (from Clients): %d", in)
 		log.Printf("Messages Out (to Clients):  %d", out)
 		log.Printf("Avg. Redis Publish Latency: %.2f ms", avgLatencyMs)
 
-		// 3. Log Statistik Pool [BARU]
+		// Log Info Channel [BARU]
+		// Ini menunjukkan berapa banyak goroutine reader yang 'HIDUP'
+		log.Printf("Active Channels (Readers):  %d", activeChannelsCount)
+
 		log.Println("- Redis Pool Stats -")
 		log.Printf("PUB Client: %d Used / %d Total (Idle: %d, Misses: %d)",
 			pubUsed, pubStats.TotalConns, pubStats.IdleConns, pubStats.Misses)
+		// Perhatikan perbandingan antara 'Active Channels' dengan 'SUB Client Used' di bawah ini
 		log.Printf("SUB Client: %d Used / %d Total (Idle: %d, Misses: %d)",
 			subUsed, subStats.TotalConns, subStats.IdleConns, subStats.Misses)
 		log.Println("-----------------------\n")
@@ -632,12 +640,12 @@ func main() {
 		log.Printf("Peringatan: PORT tidak diatur. Menggunakan default: %s", port)
 	}
 
-	if redisPubPoolSize =="" {
+	if redisPubPoolSize == "" {
 		redisPubPoolSize = "50"
 		log.Printf("Peringatan: REDIS_PUB_POOL_SIZE tidak diatur. Menggunakan default: %s", redisPubPoolSize)
 	}
-	
-	if redisSubPoolSize =="" {
+
+	if redisSubPoolSize == "" {
 		redisSubPoolSize = "50"
 		log.Printf("Peringatan: REDIS_SUB_POOL_SIZE tidak diatur. Menggunakan default: %s", redisSubPoolSize)
 	}
