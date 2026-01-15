@@ -321,6 +321,11 @@ func (h *Hub) handleClientMessages(client *Client) {
 				continue
 			}
 			h.handleSubscribe(client, &msg)
+		case "unsubscribe":
+			if msg.Channel == "" {
+				continue
+			}
+			h.handleUnsubscribe(client, &msg)
 
 		case "publish":
 			if msg.Channel == "" || len(msg.Data) == 0 || msg.MessageID == "" {
@@ -378,6 +383,28 @@ func (h *Hub) handleSubscribe(client *Client, msg *IncomingMessage) {
 	go h.sendHistoricalMessages(client, msg.Channel, startID, endID)
 
 	client.SendJSON(map[string]string{"status": "subscribed", "channel": msg.Channel})
+}
+
+// handleUnsubscribe menghapus klien dari channel tertentu
+func (h *Hub) handleUnsubscribe(client *Client, msg *IncomingMessage) {
+	h.channelsMu.Lock()
+	defer h.channelsMu.Unlock()
+
+	if clients, ok := h.channels[msg.Channel]; ok {
+		delete(clients, client)
+		log.Printf("[UNSUB] Klien unsubscribe manual dari channel: %s. Sisa: %d", msg.Channel, len(clients))
+
+		// Jika channel kosong, hapus channel dari map agar hemat memori
+		if len(clients) == 0 {
+			delete(h.channels, msg.Channel)
+            // Catatan: Goroutine reader akan berhenti sendiri nanti saat mendeteksi subscriberCount == 0
+		}
+	}
+
+	client.SendJSON(map[string]string{
+		"status":  "unsubscribed",
+		"channel": msg.Channel,
+	})
 }
 
 // handlePublish (logika dari 'case publish')
